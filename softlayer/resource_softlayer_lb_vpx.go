@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"bytes"
 	"errors"
 	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
@@ -18,12 +19,26 @@ import (
 	"github.com/softlayer/softlayer-go/services"
 	"github.com/softlayer/softlayer-go/session"
 	"github.com/softlayer/softlayer-go/sl"
+	"io/ioutil"
+	"net/http"
 )
 
 const (
 	PACKAGE_ID_APPLICATION_DELIVERY_CONTROLLER = 192
 	DELIMITER                                  = "_"
 )
+
+type NetscalerService struct {
+	Name        string `json:"name"`
+	Ip          string `json:"ip"`
+	ServiceType string `json:"servicetype"`
+	Port        int    `json:"port"`
+}
+
+type NetscalerLBServiceBinding struct {
+	Name        string `json:"name"`
+	ServiceName string `json:"serviceName"`
+}
 
 func resourceSoftLayerLbVpx() *schema.Resource {
 	return &schema.Resource{
@@ -628,4 +643,50 @@ func resourceSoftLayerLbVpxExists(d *schema.ResourceData, meta interface{}) (boo
 	nadc, err := service.Mask("id").Id(id).GetObject()
 
 	return nadc.Id != nil && *nadc.Id == id && err == nil, nil
+}
+
+func nitroHTTPRequest(sess *session.Session, nadcId int, mode string, resource string, requestType string, requestBody []byte) ([]byte, int, error) {
+
+	// Get VPX IP address and password
+	service := services.GetNetworkApplicationDeliveryControllerService(sess)
+	nadc, err := service.Id(nadcId).GetObject()
+	requestBodyBuffer := bytes.NewBuffer(requestBody)
+
+	if err != nil {
+		return nil, 0, fmt.Errorf("Error retrieving netscaler: %s", err)
+	}
+
+	// Create a request
+	nitroUrl := "http://" + *nadc.ManagementIpAddress + "/nitro/v1/" + mode + "/" + resource
+	req, err := http.NewRequest(requestType, nitroUrl, requestBodyBuffer)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if sess.Debug {
+		log.Println("[DEBUG] Nitro Request Path: ", req.URL)
+		log.Println("[DEBUG] Nitro Request Parameters: ", requestBodyBuffer.String())
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-NITRO-USER", "root")
+	req.Header.Set("X-NITRO-PASS", *nadc.Password.Password)
+
+	// Execute http request
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	defer resp.Body.Close()
+
+	responseBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+
+	if sess.Debug {
+		log.Println("[DEBUG] Nitro Response: ", string(responseBody))
+	}
+	return responseBody, resp.StatusCode, nil
 }

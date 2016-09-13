@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"encoding/json"
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/softlayer/softlayer-go/datatypes"
 	"github.com/softlayer/softlayer-go/helpers/network"
@@ -94,10 +95,16 @@ func parseServiceId(id string) (string, int, string, error) {
 func updateVpxService(sess *session.Session, nadcId int, lbVip *datatypes.Network_LoadBalancer_VirtualIpAddress) (bool, error) {
 	service := services.GetNetworkApplicationDeliveryControllerService(sess)
 	serviceName := *lbVip.Services[0].Name
+	destinationIpAddress := *lbVip.Services[0].DestinationIpAddress
+
 	successFlag := true
 	var err error
 	for count := 0; count < 10; count++ {
-		successFlag, err = service.Id(nadcId).UpdateLiveLoadBalancer(lbVip)
+		if strings.HasPrefix(destinationIpAddress, "10.") {
+			successFlag, err = updateLiveLoadBalancerPrivate(sess, nadcId, lbVip)
+		} else {
+			successFlag, err = service.Id(nadcId).UpdateLiveLoadBalancer(lbVip)
+		}
 		log.Printf("[INFO] Updating LoadBalancer Service %s successFlag : %t", serviceName, successFlag)
 
 		if err != nil && strings.Contains(err.Error(), "Operation already in progress") {
@@ -109,6 +116,60 @@ func updateVpxService(sess *session.Session, nadcId int, lbVip *datatypes.Networ
 		break
 	}
 	return successFlag, err
+}
+
+func updateLiveLoadBalancerPrivate(sess *session.Session, nadcId int, lbVip *datatypes.Network_LoadBalancer_VirtualIpAddress) (bool, error) {
+	serviceName := *lbVip.Services[0].Name
+	vipName := *lbVip.Name
+
+	// Create a virtual service
+	svc := NetscalerService{
+		Name:        *lbVip.Services[0].Name,
+		Ip:          *lbVip.Services[0].DestinationIpAddress,
+		Port:        *lbVip.Services[0].DestinationPort,
+		ServiceType: *lbVip.Services[0].HealthCheck,
+	}
+
+	svcParam := &struct {
+		Service NetscalerService `json:"service"`
+	}{Service: svc}
+
+	svcParamJson, err := json.Marshal(svcParam)
+
+	if err != nil {
+		log.Fatal(fmt.Sprintf("Failed to marshal service %s err=", serviceName, err))
+		return false, err
+	}
+
+	_, _, err = nitroHTTPRequest(sess, nadcId, "config", "service", "POST", svcParamJson)
+	if err != nil {
+		return false, err
+	}
+
+	// Bind the virtual service
+	svcBind := &struct {
+		Lbvserver_service_binding NetscalerLBServiceBinding `json:"lbvserver_service_binding"`
+	}{
+		Lbvserver_service_binding: NetscalerLBServiceBinding{
+			Name:        vipName,
+			ServiceName: serviceName,
+		},
+	}
+	svcBindJson, err := json.Marshal(svcBind)
+
+	if err != nil {
+		log.Fatal(fmt.Sprintf("Failed to marshal service_bind %s err=", serviceName, err))
+		return false, err
+	}
+
+	log.Println(string(svcBindJson))
+
+	_, _, err = nitroHTTPRequest(sess, nadcId, "config", "lbvserver_service_binding", "POST", svcBindJson)
+
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func resourceSoftLayerLbVpxServiceCreate(d *schema.ResourceData, meta interface{}) error {
